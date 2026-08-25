@@ -22,6 +22,9 @@ class DeviceDiscoveryManager(
     private val upnpRegistryListener: UpnpRegistryListener
 ) {
     fun startDiscovery() {
+        // stopDiscovery() pauses the registry. Resume it before every SSDP
+        // search so closing and reopening a cast picker can discover devices.
+        upnpService?.registry?.resume()
         upnpService?.controlPoint?.search()
     }
 
@@ -175,8 +178,8 @@ class DeviceDiscoveryManager(
      * Force refresh device list by restarting discovery
      */
     fun refreshDeviceList() {
-        upnpService?.registry?.pause()
         cleanupOfflineDevices()
+        upnpService?.registry?.resume()
         upnpService?.controlPoint?.search()
     }
 }
