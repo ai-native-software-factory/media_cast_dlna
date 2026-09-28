@@ -6,6 +6,7 @@ import DeviceUdn
 import android.util.Log
 import android.os.Handler
 import android.os.Looper
+import org.jupnp.model.meta.Device
 import org.jupnp.model.meta.LocalDevice
 import org.jupnp.model.meta.RemoteDevice
 import org.jupnp.registry.Registry
@@ -21,6 +22,13 @@ import java.lang.Exception
  * The UPnP registry callbacks are executed on background threads (e.g., jupnp-4),
  * so this class uses a Handler to post all Flutter API calls to the main thread
  * to avoid the "Methods marked with @UiThread must be executed on the main thread" error.
+ *
+ * IMPORTANT: jUPnP only notifies registry listeners for the *root* device that was
+ * actually registered. Embedded devices (e.g. a MediaRenderer nested inside a vendor
+ * wrapper device) never generate their own [RegistryListener] callbacks. Therefore every
+ * callback below walks the full embedded-device graph of the reported root and applies the
+ * media filter to each device individually, so nested renderers are discovered/removed
+ * even when the root itself is not a media device.
  */
 class UpnpRegistryListener(
     private val discoveryEventsFlutterApi: DiscoveryEventsFlutterApi? = null,
@@ -35,6 +43,14 @@ class UpnpRegistryListener(
     private val _devices = mutableListOf<DlnaDevice>()
     val devices: List<DlnaDevice> get() = _devices
     private val mainHandler = Handler(Looper.getMainLooper())
+
+    /**
+     * Maps a discovered device UDN to the UDN of the root device whose embedded graph
+     * produced it. Used to remove every descendant when its owning root goes away,
+     * independent of the media filter that was active when the descendant was discovered.
+     */
+    private val ownerRootByUdn = mutableMapOf<String, String>()
+
     @Volatile
     private var activeFilter: DiscoveryTargetFilter = DiscoveryTargetFilter.ALL_MEDIA
 
@@ -73,6 +89,7 @@ class UpnpRegistryListener(
     fun clearDiscoveredDevices() {
         val removedDevices = _devices.toList()
         _devices.clear()
+        ownerRootByUdn.clear()
 
         removedDevices.forEach { device ->
             notifyDeviceLost(device.udn)
@@ -129,18 +146,11 @@ class UpnpRegistryListener(
         return deviceType.contains("MediaRenderer", ignoreCase = true)
     }
 
-    private fun isRendererDevice(device: RemoteDevice): Boolean {
-        return isMediaDevice(device) && isRendererType(device.type.toString())
-    }
-
-    private fun isRendererDevice(device: LocalDevice): Boolean {
-        return isMediaDevice(device) && isRendererType(device.type.toString())
-    }
-
     /**
-     * Check if a device is a media device (MediaRenderer or MediaServer)
+     * Check if a device is a media device (MediaRenderer or MediaServer) matching the
+     * currently active filter.
      */
-    private fun isMediaDevice(device: RemoteDevice): Boolean {
+    private fun isMediaDevice(device: Device<*, *, *>): Boolean {
         val deviceType = device.type.toString()
 
         // First check if it's explicitly excluded
@@ -158,188 +168,179 @@ class UpnpRegistryListener(
         return isMediaDevice && matchesActiveSearchTarget(deviceType)
     }
 
+    // Traverse wrappers too: the media filter applies to each device, not its subtree.
+    private fun visitMediaDevices(
+        device: Device<*, *, *>,
+        publish: (Device<*, *, *>) -> Unit
+    ) {
+        if (isMediaDevice(device)) publish(device)
+        device.embeddedDevices?.forEach { visitMediaDevices(it, publish) }
+    }
+
     /**
-     * Check if a local device is a media device (MediaRenderer or MediaServer)
+     * Returns the UDN of the device and all of its embedded descendants, regardless of
+     * the active media filter. Used to detect devices that disappeared from an updated
+     * graph without re-applying a (possibly changed) filter.
      */
-    private fun isMediaDevice(device: LocalDevice): Boolean {
-        val deviceType = device.type.toString()
+    private fun collectAllDeviceUdns(root: Device<*, *, *>): Set<String> {
+        val udns = mutableSetOf<String>()
 
-        // First check if it's explicitly excluded
-        if (EXCLUDED_DEVICE_PREFIXES.any { deviceType.contains(it, ignoreCase = true) }) {
-            return false
+        fun visit(current: Device<*, *, *>) {
+            udns.add(current.identity.udn.identifierString)
+            val embedded = current.embeddedDevices
+            if (embedded != null) {
+                embedded.forEach { child -> visit(child) }
+            }
         }
 
-        // Check for exact match with known media device types
-        if (MEDIA_DEVICE_TYPES.contains(deviceType)) {
-            return matchesActiveSearchTarget(deviceType)
+        visit(root)
+        return udns
+    }
+
+    private fun Device<*, *, *>.toDlnaDeviceOrNull(): DlnaDevice? {
+        return when (this) {
+            is RemoteDevice -> toDlnaDevice()
+            is LocalDevice -> toDlnaDevice()
+            else -> null
+        }
+    }
+
+    /**
+     * Adds a discovered device if its UDN is not already present (dedup by UDN across
+     * roots), and records its owning root for later removal.
+     */
+    private fun addDiscoveredDevice(device: Device<*, *, *>, ownerRootUdn: String) {
+        val dlnaDevice = device.toDlnaDeviceOrNull() ?: return
+        ownerRootByUdn[dlnaDevice.udn.value] = ownerRootUdn
+
+        if (_devices.any { it.udn == dlnaDevice.udn }) {
+            return
         }
 
-        // Check for partial match with media device prefixes
-        val isMediaDevice = MEDIA_DEVICE_PREFIXES.any { deviceType.contains(it, ignoreCase = true) }
-        return isMediaDevice && matchesActiveSearchTarget(deviceType)
+        _devices.add(dlnaDevice)
+        notifyDeviceFound(dlnaDevice)
+    }
+
+    /**
+     * Refreshes the stored snapshot for a device, adding and announcing it if it was not
+     * previously known.
+     */
+    private fun updateDiscoveredDevice(device: Device<*, *, *>, ownerRootUdn: String) {
+        val dlnaDevice = device.toDlnaDeviceOrNull() ?: return
+        val index = _devices.indexOfFirst { it.udn == dlnaDevice.udn }
+        if (index != -1) {
+            _devices[index] = dlnaDevice
+        } else {
+            _devices.add(dlnaDevice)
+            notifyDeviceFound(dlnaDevice)
+        }
+        ownerRootByUdn[dlnaDevice.udn.value] = ownerRootUdn
+    }
+
+    /**
+     * Removes every discovered device owned by [ownerRootUdn] (including the root itself),
+     * emitting device-lost and, for renderers, renderer-offline events. The active media
+     * filter is deliberately not consulted so entries discovered under a previous filter
+     * are still removed correctly.
+     */
+    private fun removeOwnedDevices(ownerRootUdn: String) {
+        val iterator = _devices.iterator()
+        while (iterator.hasNext()) {
+            val device = iterator.next()
+            if (ownerRootByUdn[device.udn.value] != ownerRootUdn) {
+                continue
+            }
+            iterator.remove()
+            ownerRootByUdn.remove(device.udn.value)
+            notifyDeviceLost(device.udn)
+            if (isRendererType(device.deviceType)) {
+                notifyRendererOffline(device.udn)
+            }
+        }
+    }
+
+    /**
+     * Removes owned devices that are no longer present in an updated device graph.
+     * Uses the filter-independent UDN set so filter changes do not cause spurious removals.
+     */
+    private fun pruneOwnedDevices(ownerRootUdn: String, presentUdns: Set<String>) {
+        val iterator = _devices.iterator()
+        while (iterator.hasNext()) {
+            val device = iterator.next()
+            if (ownerRootByUdn[device.udn.value] == ownerRootUdn && device.udn.value !in presentUdns) {
+                iterator.remove()
+                ownerRootByUdn.remove(device.udn.value)
+                notifyDeviceLost(device.udn)
+                if (isRendererType(device.deviceType)) {
+                    notifyRendererOffline(device.udn)
+                }
+            }
+        }
     }
 
     override fun remoteDeviceDiscoveryStarted(registry: Registry?, device: RemoteDevice?) {
         // This method is called when remote device discovery starts.
-
-        device?.let {
-            // Only notify Flutter if this is a media device
-            if (isMediaDevice(it)) {
-              
-                // Note: We don't add the device here yet, only when discovery is complete
-            }
-        }
+        // Note: We don't add the device here yet, only when discovery is complete.
     }
 
     override fun remoteDeviceDiscoveryFailed(
         registry: Registry?, device: RemoteDevice?, e: Exception?
     ) {
-        device?.let {
-            if (isMediaDevice(it)) {
-                Log.w(
-                    "UpnpRegistryListener",
-                    "Remote device discovery failed for: ${it.details?.friendlyName}",
-                    e
-                )
+        device ?: return
 
-                // Remove the device from our list if it failed discovery
-                val dlnaDevice = it.toDlnaDevice()
-                val iterator = _devices.iterator()
-                while (iterator.hasNext()) {
-                    if (iterator.next().udn == dlnaDevice?.udn) {
-                        iterator.remove()
-                        dlnaDevice?.udn?.let { udn ->
-                            notifyDeviceLost(udn)
-                            if (isRendererDevice(it)) {
-                                notifyRendererOffline(udn)
-                            }
-                        }
-                        break
-                    }
-                }
-            }
-        }
+        val rootUdn = device.identity.udn.identifierString
+        Log.w(
+            "UpnpRegistryListener",
+            "Remote device discovery failed for: ${device.details?.friendlyName} ($rootUdn)",
+            e
+        )
+
+        // A failed discovery may have a partially hydrated graph, so rely on the recorded
+        // ownership to clear the root and any descendants discovered previously.
+        removeOwnedDevices(rootUdn)
     }
 
     override fun remoteDeviceAdded(registry: Registry?, device: RemoteDevice?) {
-        device?.let {
-            // Only process media devices
-            if (isMediaDevice(it)) {
-               
-
-                // Convert to DlnaDevice and add to devices list
-                val dlnaDevice = it.toDlnaDevice()
-                dlnaDevice?.let { dlna ->
-                    // Check if device already exists to avoid duplicates
-                    val existingIndex = _devices.indexOfFirst { d -> d.udn == dlna.udn }
-                    if (existingIndex == -1) {
-                        _devices.add(dlna)
-                        notifyDeviceFound(dlna)
-                    } else {
-                       
-                    }
-                }
-            }
-        }
+        device ?: return
+        val ownerRootUdn = device.identity.udn.identifierString
+        visitMediaDevices(device) { addDiscoveredDevice(it, ownerRootUdn) }
     }
 
     override fun remoteDeviceUpdated(registry: Registry?, device: RemoteDevice?) {
-        device?.let {
-            // Only process media devices
-            if (isMediaDevice(it)) {
-                // Convert to DlnaDevice and update in the list
-                val dlnaDevice = it.toDlnaDevice()
-                dlnaDevice.let { dlna ->
-                    val index = _devices.indexOfFirst { d -> d.udn == dlna.udn }
-                    if (index != -1) {
-                        _devices[index] = dlna
-                       
-                    } else {
-                        _devices.add(dlna)
-                        notifyDeviceFound(dlna)
-                    }
-                }
-            }
-        }
+        device ?: return
+        val ownerRootUdn = device.identity.udn.identifierString
+        val presentUdns = collectAllDeviceUdns(device)
+        visitMediaDevices(device) { updateDiscoveredDevice(it, ownerRootUdn) }
+        pruneOwnedDevices(ownerRootUdn, presentUdns)
     }
 
     override fun remoteDeviceRemoved(registry: Registry?, device: RemoteDevice?) {
-        //remove device with same udn
         val deviceUdn = device?.identity?.udn ?: return
-       
-        // Remove the device from our list
-        val iterator = _devices.iterator()
-        while (iterator.hasNext()) {
-            if (iterator.next().udn.value == deviceUdn.identifierString) {
-                iterator.remove()
-                val removedDeviceUdn = DeviceUdn(deviceUdn.identifierString)
-                notifyDeviceLost(removedDeviceUdn)
-                if (device != null && isRendererDevice(device)) {
-                    notifyRendererOffline(removedDeviceUdn)
-                }
-                break
-            }
-        }
+        removeOwnedDevices(deviceUdn.identifierString)
     }
 
     override fun localDeviceAdded(registry: Registry?, device: LocalDevice?) {
-        device?.let {
-            // Only process media devices
-            if (isMediaDevice(it)) {
-              
-
-                // Convert to DlnaDevice and add to devices list
-                val dlnaDevice = it.toDlnaDevice()
-                dlnaDevice?.let { dlna ->
-                    // Check if device already exists to avoid duplicates
-                    val existingIndex = _devices.indexOfFirst { d -> d.udn == dlna.udn }
-                    if (existingIndex == -1) {
-                        _devices.add(dlna)
-                        notifyDeviceFound(dlna)
-                    } else {
-                      
-                    }
-                }
-            }
-        }
+        device ?: return
+        val ownerRootUdn = device.identity.udn.identifierString
+        visitMediaDevices(device) { addDiscoveredDevice(it, ownerRootUdn) }
     }
 
     override fun localDeviceRemoved(registry: Registry?, device: LocalDevice?) {
-        device?.let {
-            // Only process media devices
-            if (isMediaDevice(it)) {
-              
-
-                // Remove the device from our list
-                val dlnaDevice = it.toDlnaDevice()
-                dlnaDevice?.let { dlna ->
-                    val iterator = _devices.iterator()
-                    while (iterator.hasNext()) {
-                        if (iterator.next().udn == dlna.udn) {
-                            iterator.remove()
-                            notifyDeviceLost(dlna.udn)
-                            if (isRendererDevice(it)) {
-                                notifyRendererOffline(dlna.udn)
-                            }
-                            break
-                        }
-                    }
-                }
-            }
-        }
+        val deviceUdn = device?.identity?.udn ?: return
+        removeOwnedDevices(deviceUdn.identifierString)
     }
 
     override fun beforeShutdown(registry: Registry?) {
         // This method is called before the registry is shut down.
         // Clear all devices from the list
-
         _devices.clear()
+        ownerRootByUdn.clear()
     }
 
     override fun afterShutdown() {
         // This method is called after the registry has been shut down.
         // Ensure devices list is cleared
-
         _devices.clear()
+        ownerRootByUdn.clear()
     }
 }
